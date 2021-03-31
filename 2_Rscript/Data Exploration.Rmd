@@ -1,0 +1,1246 @@
+---
+title: "Analytics Edge - Rebalancing Bluebikes"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Set path to your work directory
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(magrittr)
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(lars)
+library(leaps)
+library(gbm)
+library(tibble)
+library(ROCR)
+library(shiny)
+library(leaflet)
+library(leaflet.minicharts)
+library(RColorBrewer)
+library(leaftime)
+```
+
+# Weather data
+
+We are interested in: 
+
+* tmpf: Air temperature in Fahrenheit
+
+* relh: Relative humidity in %
+
+* drct: Wind direction
+
+* sknt: Wind speed in knots
+
+* p01i: Precipitation during the last hour
+
+* alti: Pressure altimeter
+
+* vsby: Visibility in miles
+
+* gust: Wind gust in knots
+
+* ice_accretion_6hr: Ice accretion over 6 hours (inches)
+
+* feel: Apparent temperature in Fahrenheit
+
+May question whether or not it's good to keep both tmpf and feel -- will see in the model.
+
+What about clouds too??? Will have to dig on that!
+
+
+I also group observations by 6h time period (00-6, 6-12, 12-18, 18-00).
+
+```{r}
+wthr.int = "6h"
+wthr = read.csv("BOS_weather.csv") %>%
+  select(valid, tmpf, relh, drct, sknt, p01i, alti, vsby, gust, ice_accretion_6hr, feel) %>%
+  mutate(valid = as.POSIXct(valid),
+         time.interval = floor_date(valid, wthr.int),
+         .after = "valid") %>%
+  rename(time = valid)
+
+wthr = wthr %>% group_by(time.interval) %>%
+  summarise(avg.temp = mean(tmpf, na.rm = TRUE),
+            avg.hmd = mean(relh, na.rm = TRUE),
+            avg.drct = mean(drct, na.rm = TRUE),
+            avg.wind = mean(sknt, na.rm = TRUE),
+            sum.pcpt = sum(p01i, na.rm = TRUE), 
+            avg.press = mean(alti, na.rm = TRUE),
+            avg.vis = mean(vsby, na.rm = TRUE),
+            max.gust = max(gust, na.rm = TRUE), # The warning on max doesn't matter
+            avg.ice.6h = mean(ice_accretion_6hr, na.rm = TRUE),
+            avg.feel = mean(feel, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(max.gust = ifelse(max.gust < 0,avg.wind, max.gust),
+         avg.ice.6h = ifelse(is.na(avg.ice.6h), 0, avg.ice.6h))
+
+
+# I could try to do that just a few time. Or I observe that most NaNs are in from August up to end of year ... Or else I could just remove this column but I would feel it's pretty important 
+# I think it's worth looking at it with and without this variable. Way to impute this value could be to regress it based on actual temperature, wind and humidity. However it may also be redundant with other variables.
+```
+
+This looks good!
+
+
+
+
+# Clasic datasets
+
+```{r}
+
+### Define the reference time interval the notebook uses
+time.int = '1h' # Could be for example '15 min'
+
+rides_201909 = read.csv("201909-bluebikes-tripdata.csv")
+# rides_201904 = read.csv("201904-bluebikes-tripdata.csv")
+# rides_201905 = read.csv("201905-bluebikes-tripdata.csv")
+# rides_201906 = read.csv("201906-bluebikes-tripdata.csv")
+# rides_201907 = read.csv("201907-bluebikes-tripdata.csv")
+# rides_201908 = read.csv("201908-bluebikes-tripdata.csv")
+
+df <- rides_201909 %>% mutate(starttime = as.POSIXct(starttime),
+                              stoptime = as.POSIXct(stoptime),
+                              gender = as.factor(gender),
+                              start.year = as.integer(format(starttime, "%Y")),
+                              start.month = as.integer(format(starttime, "%m")),
+                              start.day.of.month = as.integer(format(starttime, "%d")),
+                              start.day.of.week = as.integer(format(starttime, "%w")),
+                              start.hour = as.integer(format(starttime, "%H")),
+                              start.min = as.integer(format(starttime, "%M")),
+                              start.time.of.day = start.hour + (start.min/60), 
+                              start.quarter = as.integer(start.time.of.day*4)/4,
+                              .keep = "unused",
+                              start.station.latitude = as.numeric(start.station.latitude),
+                              start.station.longitude = as.numeric(start.station.longitude),
+                              end.station.latitude = as.numeric(end.station.latitude),
+                              end.station.longitude = as.numeric(end.station.longitude)) %>%
+  mutate(
+    start.time.interval = floor_date(starttime, time.int),
+    .after = "starttime"
+  ) %>%
+  mutate(
+    stop.time.interval = floor_date(stoptime, time.int),
+    .after= 'stoptime'
+    )
+
+# Merging df with stations to get number of docks
+
+stations = read.csv("current_bluebikes_stations.csv")
+colnames(stations) = stations[1,]
+stations = stations[2:dim(stations)[1],] %>% rename(docks = 'Total docks') %>% 
+  mutate(Latitude = as.numeric(Latitude), Longitude = as.numeric(Longitude))
+glimpse(stations)
+
+
+
+df <- df %>%
+    merge(stations %>% select(Name, docks),
+        by.x = 'end.station.name',
+        by.y = 'Name',
+        suffixes = c('','.end'), all.x = TRUE) %>%
+  merge(stations %>% select(Name, docks),
+        by.x = 'start.station.name',
+        by.y = 'Name',
+        suffixes = c('','.start'), all.x = TRUE) %>%
+  mutate(docks.start= as.numeric(docks.start),
+         docks.end = as.numeric(docks),
+         .keep = 'unused'
+         )
+
+# Getting the station.id from the df dataframe per station - dont know why it is NOT in the station file.
+
+stations <- stations %>%
+  merge(df %>% select(station.name = start.station.name, station.id = start.station.id) %>%
+          group_by(station.name, station.id) %>% summarise(total.rides = n()),
+        by.x = 'Name',
+        by.y = 'station.name',
+        all.x = TRUE) %>%
+  arrange(desc(total.rides))
+```
+
+```{r}
+quantile(df$tripduration, c(0.25,0.5,0.75, .9))
+```
+
+
+## Top 10 stations
+
+```{r}
+stations %>% head(10)
+```
+
+## Visualizing number of rides
+
+```{r}
+df_count_rides <- df %>% filter(start.day.of.month <= 28) %>%
+  group_by(start.quarter, start.day.of.week) %>%
+  summarise(number.of.rides = n()) %>%
+  ungroup()
+
+# Scatter plot by day of week
+ggplot(data=df_count_rides,aes(x=start.quarter)) +
+  geom_point(aes(y=number.of.rides, color=factor(start.day.of.week)),size=.5) +
+  theme_bw() +
+  ylab("Number of rides across the city") +
+  theme(axis.title=element_text(size=10), axis.text=element_text(size=10), legend.title=element_text(size=10), legend.text=element_text(size=12)) + 
+  scale_color_brewer(name='Weekday',labels=c('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'), palette="Set1")
+```
+
+## Computing departure, arrival and net arrival rate per station per time interval
+
+```{r}
+# Compute the net activity per hour 
+
+df.departure <- df %>% group_by(start.time.interval, start.station.name) %>%
+  summarise(number.of.departures = n()) %>%
+  ungroup()
+
+df.arrival <- df %>% group_by(stop.time.interval, end.station.name) %>%
+  summarise(number_of_arrival = n()) %>%
+  ungroup()
+
+# This df contains net arrival rate per station per time interval.
+df.net.arrival <- df.departure %>% 
+  merge(df.arrival,
+        by.x = c('start.station.name','start.time.interval'),
+        by.y = c('end.station.name','stop.time.interval'),
+        all.x = TRUE,
+        all.y = TRUE
+  ) %>%
+  rename(station.name = start.station.name)
+
+df.net.arrival <- df.net.arrival %>%
+  complete(start.time.interval = seq(as.POSIXct('2019-09-01 00:00:00:0000'), 
+                                     as.POSIXct('2019-10-01 00:00:00:0000'), by = '1 hour'), station.name) %>%
+  merge(stations %>% select(-c(Number, total.rides)),
+        by.x = 'station.name',
+        by.y = 'Name',
+        all.x = TRUE) %>%
+  mutate(start.day.of.month = as.integer(format(start.time.interval, "%d")),
+         number_of_arrival = replace_na(number_of_arrival,0),
+         number.of.departures = replace_na(number.of.departures,0),
+         net.arrival.rate = number_of_arrival - number.of.departures) %>%
+  arrange(station.name, start.time.interval) %>%
+  group_by(station.name, start.day.of.month) %>%
+  mutate(cum.net.arrival = cumsum(net.arrival.rate)) %>%
+  ungroup()
+```
+
+```{r}
+ggplot(data=df.net.arrival %>% filter(station.name == '175 N Harvard St')) +
+  geom_line(aes(x =start.time.interval, y=cum.net.arrival, color = factor(start.day.of.month))) +
+  theme_bw() +
+  ylab("Cumulative net arrivals") +
+  theme(axis.title=element_text(size=10), axis.text=element_text(size=10), legend.title=element_text(size=10),
+        legend.text=element_text(size=12))
+```
+
+
+
+
+
+
+
+# Heuristic on full/empty stations -- Not useful anymore
+
+```{r}
+### Heuristic for empty/full stations
+# Play on parameters to have something more smooth!!!
+
+# Huge problem: Some time slots are both empty and nonempty.
+
+## For empty stations
+df.net.arrival <- df.net.arrival %>% 
+  group_by(station.name) %>%
+  mutate(empty = 0) %>%
+  mutate(empty = case_when((lag(net.arrival.rate) <= -2) & (net.arrival.rate >= -1) & (net.arrival.rate <= 2) ~ 1,
+                           TRUE ~ 0)) %>%
+  ungroup()
+
+# Careful - this is long - I don't know how to make it faster
+# What I do is that I propagate the empty only one by one - trying a loop was way slower
+# 96 is for a day (1 day = 24 * 4 quarters = 96 quarters)
+for (i in 1:96){
+  df.net.arrival <- df.net.arrival %>%
+    group_by(station.name) %>%
+    mutate(empty = case_when((lag(empty) == 1) & (net.arrival.rate <= 1) & (net.arrival.rate >= -1) ~ 1,
+                             empty == 1 ~ 1,
+                             TRUE ~ 0))
+}
+
+## For full stations
+df.net.arrival <- df.net.arrival %>% 
+  group_by(station.name) %>%
+  mutate(full = 0) %>%
+  mutate(full = case_when((lag(net.arrival.rate) >= 2) & (net.arrival.rate <= 1) & (net.arrival.rate >= -2) ~ 1,
+                           TRUE ~ 0)) %>%
+  ungroup()
+
+# Careful - this is long - I don't know how to make it faster
+for (i in 1:96){
+  df.net.arrival <- df.net.arrival %>%
+    group_by(station.name) %>%
+    mutate(full = case_when((lag(full) == 1) & (net.arrival.rate >= -1) & (net.arrival.rate <= 1) ~ 1,
+                             full == 1 ~ 1,
+                             TRUE ~ 0))
+}
+```
+
+```{r}
+view(df.net.arrival %>% filter(station.name == 'Kendall T'))
+```
+
+
+
+
+
+
+
+
+
+
+
+## Computing the net evolution of number of bikes in a station during the day
+
+```{r}
+# Approach: Build a database for each station, where events per this station are listed.
+
+start.event.stations = df %>%
+  select(station.id = start.station.id, station.name = start.station.name, time = starttime, 
+         time.interval = start.time.interval, year = start.year, month = start.month, 
+         day.of.month = start.day.of.month, day.of.week = start.day.of.week, hour = start.hour, 
+         min = start.min, tripduration, station.latitude = start.station.latitude,
+         station.longitude = start.station.longitude, bikeid, usertype, docks = docks.start) %>%
+  mutate(start.ind = 1, end.ind = 0)
+
+end.event.stations = df %>% mutate(year = as.integer(format(stoptime, "%Y")),
+                                   month = as.integer(format(stoptime, "%m")),
+                                   day.of.month = as.integer(format(stoptime, "%d")),
+                                   day.of.week = as.integer(format(stoptime, "%w")),
+                                   hour = as.integer(format(stoptime, "%H")),
+                                   min = as.integer(format(stoptime, "%M"))) %>%
+  select(station.id = end.station.id, station.name = end.station.name, time = stoptime, 
+         time.interval = stop.time.interval, year, month, day.of.month, day.of.week, hour, min,
+         tripduration, station.latitude = end.station.latitude,
+         station.longitude = end.station.longitude, bikeid, usertype, docks = docks.end) %>%
+  mutate(end.ind = 1, start.ind = 0)
+
+event.stations = start.event.stations %>%
+  merge(end.event.stations, all.x = TRUE, all.y = TRUE) %>%
+  arrange(time) %>%
+  group_by(day.of.month, station.id) %>%
+  mutate(cum.departures = cumsum(replace_na(start.ind, 0)),
+         cum.arrivals = cumsum(replace_na(end.ind, 0)),
+         net.daily.arrivals = cum.arrivals - cum.departures)
+```
+
+
+```{r}
+# Scatter plot by day
+ggplot(data=event.stations %>% filter(station.name == '175 N Harvard St')) +
+  geom_line(aes(x =time, y=net.daily.arrivals, color = factor(day.of.month))) +
+  theme_bw() +
+  ylab("Cumulative net arrivals") +
+  theme(axis.title=element_text(size=10), axis.text=element_text(size=10), legend.title=element_text(size=10), legend.text=element_text(size=12))
+```
+
+```{r}
+# Scatter plot by day - Change the name of the station
+name = "Dana Park"
+
+ggplot(data=event.stations %>% filter(station.name == name) %>% 
+         mutate(week.time = min+60*hour+1440*day.of.week)) +
+  geom_line(aes(x = week.time, y=net.daily.arrivals, color = factor(day.of.month))) +
+  geom_hline(aes(yintercept=0*as.numeric((stations %>% filter(Name == name))$docks)), color = "red") +
+  geom_hline(aes(yintercept=-as.numeric((stations %>% filter(Name == name))$docks)), color = "red") +
+  theme_bw() +
+  ylab("Cumulative net arrivals") +
+  theme(axis.title=element_text(size=10), axis.text=element_text(size=10), legend.title=element_text(size=10), legend.text=element_text(size=12))
+```
+
+```{r}
+# station.names = unique(event.stations$station.name)
+# station.names = sample(station.names,5)
+station.names = c("Kendall T",
+                  "One Broadway / Kendall Sq at Main St / 3rd St",
+                  "Third at Binney",
+                  "Kendall Street",
+                  "One Memorial Drive")
+
+for (name in station.names) {
+  plt = ggplot(data=event.stations %>% filter(station.name == name) %>%
+                 mutate(week.time = min+60*hour+1440*day.of.week)) +
+    geom_line(aes(x = week.time, y=net.daily.arrivals, color = factor(day.of.month))) +
+    geom_hline(aes(yintercept=as.numeric((stations %>% filter(Name == name))$docks)), color = "red") +
+    geom_hline(aes(yintercept=-as.numeric((stations %>% filter(Name == name))$docks)), color = "red") +
+    theme_bw() +
+    ylab("Cumulative net arrivals") +
+    labs(title = name) +
+    theme(axis.title=element_text(size=10), axis.text=element_text(size=10), 
+          legend.title=element_text(size=10), legend.text=element_text(size=12))
+  print(plt)
+}
+```
+
+## Network flows through the day
+
+```{r}
+### Current time.interval of 1h
+network.flows <- rides_201909 %>% mutate(starttime = as.POSIXct(starttime),
+                              stoptime = as.POSIXct(stoptime),
+                              gender = as.factor(gender),
+                              start.year = as.integer(format(starttime, "%Y")),
+                              start.month = as.integer(format(starttime, "%m")),
+                              start.day.of.month = as.integer(format(starttime, "%d")),
+                              start.day.of.week = as.integer(format(starttime, "%w")),
+                              start.hour = as.integer(format(starttime, "%H")),
+                              start.min = as.integer(format(starttime, "%M")),
+                              start.time.of.day = start.hour + (start.min/60), 
+                              start.quarter = as.integer(start.time.of.day*4)/4,
+                              .keep = "unused") %>%
+  mutate(                                                                     # Intervals of 1h
+    start.time.interval = floor_date(starttime, time.int),
+    .after = "starttime"
+  ) %>%
+  mutate(
+    stop.time.interval = floor_date(stoptime, time.int),
+    .after= 'stoptime'
+    ) %>%
+  group_by(start.station.name, end.station.name, start.time.interval) %>%
+  summarise(hourly.dep.flow = n()) %>%                                        # Now adding departure_flow
+  merge(stations %>% select(Name, docks, Latitude, Longitude),                # Adding number of docks per station
+        by.x = 'start.station.name',
+        by.y = 'Name',
+        suffixes = c('','.start'), all.x = TRUE) %>%
+  merge(stations %>% select(Name, docks, Latitude, Longitude),
+        by.x = 'end.station.name',
+        by.y = 'Name',
+        suffixes = c('','.end'), all.x = TRUE) %>%
+  rename(start.docks = docks, end.docks = docks.end, start.latitude = Latitude, start.longitude = Longitude,
+         end.latitude = Latitude.end, end.longitude = Longitude.end) %>%
+  arrange(start.station.name, start.time.interval, end.station.name) %>%
+  group_by(start.station.name, start.time.interval) %>%                       # Now adding total_flows
+  mutate(hourly.dep.flow.total = sum(hourly.dep.flow)) %>%
+  ungroup() %>%
+  mutate(hourly.dep.flow.pct = hourly.dep.flow / hourly.dep.flow.total) %>%
+  complete(start.time.interval = seq(as.POSIXct('2019-09-01 00:00:00:0000'), 
+                                     as.POSIXct('2019-10-01 00:00:00:0000'), by = "1 hour"), 
+           start.station.name, end.station.name) ## Maybe better to complete after we aggregate the data!
+```
+
+```{r}
+# Extract for Ani
+extc <- network.flows %>% filter(start.station.name %in% c("Kendall T", "MIT Pacific St at Purrington St", "Beacon St at Massachusetts Ave", "MIT Vassar St") & end.station.name %in% c("Kendall T", "MIT Pacific St at Purrington St", "Beacon St at Massachusetts Ave", "MIT Vassar St"))
+
+write.csv(extc,'Ani_extract.csv')
+```
+
+# Distance traveled by bikes
+
+```{r}
+library(geosphere)
+df <- df %>% rowwise() %>%
+  mutate(distance = distm(c(start.station.longitude, start.station.latitude), 
+                                c(end.station.longitude, end.station.latitude), fun = distHaversine)) %>%
+  ungroup() %>%
+  mutate(distance = distance / 1609)
+```
+
+```{r}
+bike_dist <- df %>%
+  group_by(bikeid, start.year, start.day.of.month) %>%
+  summarise(tot.dist.day =sum(distance)) %>%
+  ungroup()
+
+quantile(bike_dist$tot.dist.day, c(0.25,0.5,0.75, .95, .99))
+```
+
+
+
+
+
+
+
+# Aggregating the stations and visualizing network flows
+
+```{r}
+stations = stations %>% filter(District %in% c("Cambridge", "Boston"))
+set.seed(147)
+km50 <- kmeans(stations %>% select(Longitude, Latitude), 
+               centers = 50, iter.max=1000) 
+stations$area <- km50$cluster
+km50centroids <- km50$centers
+table(clusters50)
+```
+
+```{r}
+stations <- stations %>% merge(data.frame(km50centroids),
+                   by.x = 'area',
+                   by.y = 0,
+                   suffixes = c('','.area'), all.x = TRUE)
+
+flows_final <- df %>%
+  merge(stations %>% select(Name, Latitude.area, Longitude.area, area),                # Adding number of docks per station and area
+        by.x = 'start.station.name',
+        by.y = 'Name',
+        suffixes = c('','.start'), all.x = TRUE) %>%
+  merge(stations %>% select(Name, Latitude.area, Longitude.area, area),
+        by.x = 'end.station.name',
+        by.y = 'Name',
+        suffixes = c('','.end'), all.x = TRUE) %>%
+  rename(start.latitude = Latitude.area, start.longitude = Longitude.area,
+         end.latitude = Latitude.area.end, end.longitude = Longitude.area.end, start.area = area, end.area = area.end) %>%
+  group_by(start.area, end.area, start.time.interval) %>%
+  summarise(hourly.dep.flow = n()) %>%                                # Now adding departure_flow
+  ungroup() %>%                                                      
+  arrange(start.area, start.time.interval, end.area) %>%
+  group_by(start.area, start.time.interval) %>%                       # Now adding total_flows
+  mutate(hourly.dep.flow.total = sum(hourly.dep.flow)) %>%
+  ungroup() %>%
+  mutate(hourly.dep.flow.pct = hourly.dep.flow / hourly.dep.flow.total) %>% # Here is where we group flows per area
+  complete(start.time.interval = seq(as.POSIXct('2019-09-01 00:00:00:0000'), 
+                                     as.POSIXct('2019-09-30 23:00:00:0000'), by = '1 hour'), 
+           start.area, end.area) %>%
+  drop_na(start.area, end.area) %>%
+  mutate(hourly.dep.flow = ifelse(is.na(hourly.dep.flow), 0, hourly.dep.flow),
+         hourly.dep.flow.total = ifelse(is.na(hourly.dep.flow.total), 0, hourly.dep.flow.total),
+         hourly.dep.flow.pct = ifelse(is.na(hourly.dep.flow.pct), 0, hourly.dep.flow.pct))
+```
+
+```{r}
+
+agg_stations = data.frame(km50centroids)
+
+m <- leaflet(agg_stations) %>%
+  setView(lng = -71.0589, lat = 42.3601, zoom = 12) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addCircleMarkers()
+    # radius = ~value/60,
+    # color = ~pal(key),
+    # opacity = ~.5,
+    # popup = ~station
+#  ) %>%
+  # addLegend("bottomright", pal = pal, values = ~key,
+  #   title = "Morning departure/Evening arrival",
+  #   labels = c('Total number of bikes that started one day in station', 'Total number of bikes that finished one day in station'),
+  #   opacity = 1
+  # )
+m
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Determine where do bike go from the beginning to the end of the day.
+
+```{r}
+# There are 'only' 3496 bikes for 300ish stations - 10 bikes per station
+bikes = unique(df$bikeid)
+length(unique(df$bikeid))
+```
+
+Look at each bike id throughout the day, where it started and to where is his last trip. Thera are 'only' 3496 different bikes in our dataset.
+
+I want, for each bike in the dataset:
+
+* the station it departed from first time and time associated
+
+* I don't exactly care about the stations it goes through, however I could try to look at the number of stations
+
+* the station it arrived in the evening and time associated
+
+
+**Suggestion: Start the day at 3am instead of starting it at midnight -- shouldn't change much.**
+
+```{r}
+# Just the definition of the function
+
+daily.bike.trips = function(day.of.month, df) {
+  day <- df %>% filter(start.day.of.month == day.of.month) %>% arrange(starttime)
+  len = length(unique(df$bikeid))
+  bike.trips = data.frame(bikeid = unique(df$bikeid), start.station.name = character(len), start.time = POSIXct(len), 
+                        end.station.name = character(len), end.time = POSIXct(len))
+  
+  start = Sys.time()
+  
+  row.names(bike.trips) = bike.trips$bikeid
+  
+  for (row in 1:nrow(day)){
+    bike = as.character(day[row, "bikeid"])
+      if (bike.trips[bike,"start.station.name"] == ""){
+        bike.trips[bike, "start.station.name"] <- day[row, "start.station.name"]
+        bike.trips[bike, "start.time"] <- day[row, "starttime"]
+        bike.trips[bike, "end.station.name"] <- day[row, "end.station.name"]
+        bike.trips[bike, "end.time"] <- day[row, "stoptime"]
+      }
+      else{
+        bike.trips[bike, "end.station.name"] <- day[row, "end.station.name"]
+        bike.trips[bike, "end.time"] <- day[row, "stoptime"]
+      }
+  }
+  
+  bike.trips <- bike.trips %>% filter(!(start.station.name == ""))
+  
+  bike.trips <- bike.trips %>% mutate(day.of.month = day.of.month)
+  
+  difftime(Sys.time(), start)
+  
+  return(bike.trips)
+}
+```
+
+
+So, we have some data on where the bikes actually go from the beginning of the day to the end of the day.
+
+```{r}
+### CAREFUL -- GO DIRECTLY NEXT CELL, WHERE RESULT IS LOADED -- this function actually take 6' to run !!
+
+# day.bike.trips = daily.bike.trips(1, df)
+# 
+# for (day.of.month in 2:28){
+#   trips = daily.bike.trips(2, df)
+#   day.bike.trips = rbind(day.bike.trips, trips)
+# }
+# 
+# save(day.bike.trips, file="daybiketrips.RDA")
+```
+
+
+WE CAN DIRECTLY LOAD THE DATAFRAME HERE
+```{r}
+load("daybiketrips.RDA") # Creates the bike.trips data.frame
+
+# Get latitude and longitude of start and end stations
+day.bike.trips <- day.bike.trips  %>%  
+  merge(stations %>% select(Name, docks, Latitude, Longitude),                # Adding lat/long/number of docks
+        by.x = 'start.station.name',
+        by.y = 'Name',
+        suffixes = c('','.start'), all.x = TRUE) %>%
+  merge(stations %>% select(Name, docks, Latitude, Longitude),
+        by.x = 'end.station.name',
+        by.y = 'Name',
+        suffixes = c('','.end'), all.x = TRUE) %>%
+  rename(start.docks = docks, end.docks = docks.end, start.latitude = Latitude, start.longitude = Longitude,
+         end.latitude = Latitude.end, end.longitude = Longitude.end)
+
+### CAREFUL: We have a few NaNs because station names don't perfectly match -- Don't know why ...
+```
+
+
+```{r}
+## Exploring it from here
+top.bike.departure <- day.bike.trips %>%
+  group_by(start.station.name, start.latitude, start.longitude) %>%
+  summarise(n.bikes.dep = n()) %>%
+  ungroup() %>%
+  arrange(desc(n.bikes.dep)) %>%
+  mutate(lat = as.numeric(start.latitude), long = as.numeric(start.longitude))
+
+top.bike.arrival <- day.bike.trips %>%
+  group_by(end.station.name, end.latitude, end.longitude) %>%
+  summarise(n.bikes.arr = n()) %>%
+  ungroup() %>%
+  arrange(desc(n.bikes.arr)) %>%
+  mutate(lat = as.numeric(end.latitude), long = as.numeric(end.longitude)) %>%
+  select(-c(end.latitude, end.longitude))
+
+cum.bike.dep.arr <- top.bike.arrival %>%
+  merge(top.bike.departure %>% select('start.station.name', 'n.bikes.dep'),
+        by.x = 'end.station.name',
+        by.y = 'start.station.name') %>%
+  rename(station = end.station.name,)
+```
+
+```{r}
+top.bike.departure %>% head(10)
+
+top.bike.arrival %>% head(10)
+
+cum.bike.dep.arr %>% head(10)
+```
+
+Next step is a visualization step: plot stations on the map as well as many different characteristics about this station.
+
+
+
+
+
+
+
+
+
+
+
+
+# Visualization
+
+```{r}
+pal <- colorFactor(c("orange", "blue"), domain = c("n.bikes.arr", "n.bikes.dep"))
+
+cum.bike.dep.arr <- cum.bike.dep.arr %>%
+  gather(key = 'key', value = 'value', c(n.bikes.dep, n.bikes.arr))
+
+m <- leaflet(cum.bike.dep.arr) %>%
+  setView(lng = -71.0589, lat = 42.3601, zoom = 12) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addCircleMarkers(
+    radius = ~value/60,
+    color = ~pal(key),
+    opacity = ~.5,
+    popup = ~station
+  ) %>%
+  addLegend("bottomright", pal = pal, values = ~key,
+    title = "Morning departure/Evening arrival",
+    labels = c('Total number of bikes that started one day in station', 'Total number of bikes that finished one day in station'),
+    opacity = 1
+  )
+m
+```
+
+```{r}
+
+## The following was a first try -- does not work in the end -- don't know why
+
+# net.plot <- network.flows %>% filter(start.time.interval == time.interval) %>% drop_na()
+# net.plot <- gcIntermediate(net.plot[,c('start.longitude','start.latitude')], 
+#                            net.plot[,c('end.longitude','end.latitude')])
+# net.plot$dep <- network.flows$hourly.dep.flow
+# net.plot$start.station <- network.flows$start.station.name
+# net.plot$end.station <- network.flows$end.station.name
+# 
+# hover <- paste0(net.plot$start.station, " to ", 
+#                 net.plot$end.station, ': ', 
+#                 as.character(net.plot$dep))
+
+## I added this to network map ::
+# %>%
+#   addPolylines(data = net.plot, weight = ~dep, label = hover,
+#                group = ~start.station.name, color = ~pal3(start.station.name))
+
+
+### AAAH I don't know how to add lines between circles -- I abandon for now -- Was trying with netplot2
+
+time.interval = '2019-09-02 16:00:00.0000'
+time.interval = floor_date(as.POSIXct(time.interval), time.int)
+
+pal2 <- colorFactor(c("orange", "navy"), domain = c("number_of_arrival", "number.of.departures"))
+
+net.plot2 <- network.flows %>% filter(start.time.interval == time.interval)
+net.plot2$id <- rownames(net.plot2)
+net.plot2 <- data.frame(id = net.plot2$id,
+                        weight = net.plot2$hourly.dep.flow,
+                        lat = c(net.plot2$start.latitude, net.plot2$end.latitude), 
+                        long = c(net.plot2$start.longitude, net.plot2$end.longitude))
+
+pal3 <- colorFactor(brewer.pal(10, 'Set2'), stations$Name)
+
+network_map <- leaflet() %>%
+  setView(lng = -71.0589, lat = 42.3601, zoom = 12) %>% # On Boston
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addCircleMarkers(
+    data = df.net.arrival %>% gather(key = 'key', value = 'value', c(number.of.departures, number_of_arrival)) %>%
+      filter(start.time.interval == time.interval),
+    lng = ~as.numeric(Longitude),
+    lat = ~as.numeric(Latitude),
+    radius = ~value,
+    color = ~pal2(key),
+    opacity = ~.5,
+    popup = ~station.name
+  ) # %>%
+  # addPolylines(data = net.plot2, weight = ~weight,
+  #              group = ~id, color = ~pal3(start.station.name))
+network_map
+
+```
+
+```{r}
+## Tentative to add a timeline -- not successful
+
+## Could use that to create a shiny app
+# https://towardsdatascience.com/eye-catching-animated-maps-in-r-a-simple-introduction-3559d8c33be1
+
+# Input
+day = 2
+
+pal2 <- colorFactor(c("orange", "navy"), domain = c("number_of_arrival", "number.of.departures"))
+
+net.plot2 <- network.flows %>% filter(as.integer(format(start.time.interval, "%d")) == day)
+net.plot2$id <- rownames(net.plot2)
+net.plot2 <- data.frame(id = net.plot2$id,
+                        weight = net.plot2$hourly.dep.flow,
+                        time.interval = net.plot2$start.time.interval,
+                        lat = c(net.plot2$start.latitude, net.plot2$end.latitude), 
+                        long = c(net.plot2$start.longitude, net.plot2$end.longitude))
+
+library(geojsonio)
+plot3 <- geojsonio::geojson_json(df.net.arrival %>% 
+                                   gather(key = 'key', value = 'value', c(number.of.departures, number_of_arrival)) %>%
+                                   filter(as.integer(format(start.time.interval, "%d")) == day) %>%
+                                   drop_na() %>%
+                                   mutate(start = start.time.interval, end = start.time.interval + 60*60),
+                         lat="Latitude",lon="Longitude", )
+
+
+network_map <- leaflet(plot3) %>%
+  setView(lng = -71.0589, lat = 42.3601, zoom = 12) %>% # On Boston
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addCircleMarkers(
+    lng = ~as.numeric(Longitude),
+    lat = ~as.numeric(Latitude),
+    radius = ~value,
+    color = ~pal2(key),
+    opacity = ~.5,
+    popup = ~station.name
+  ) %>%
+  addTimeline()
+network_map
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Linear regression for prediction in Sept 2019
+
+```{r}
+year_data <- read_csv("main_result.csv")
+year_data <- year_data %>%
+  mutate(Year = as.numeric(substr(Month, 4,5)), Month = as.factor(substr(Month, 1,3))) %>%
+  select(Year, Month, Min_Bikes) %>%
+  spread(Month, Min_Bikes)
+print(year_data)
+
+ggplot(data = year_data %>% gather(actual_month, num_bikes, -c(Year, sep))) +
+  geom_point(aes(x=num_bikes, y=sep, color=actual_month)) +
+  theme_bw() +
+  ylab("") +
+  theme(axis.title=element_text(size=10), axis.text=element_text(size=10),
+        legend.title=element_text(size=10),
+        legend.text=element_text(size=12))
+```
+
+```{r}
+library(corrplot)
+corrplot(cor(year_data %>% select(-Year)), type = "upper", 
+         tl.col = "black", tl.srt = 30, tl.cex=0.6)
+```
+
+
+```{r}
+lmod = lm(sep~ may + jul , data=year_data %>% filter(Year <= 18))
+summary(lmod)
+
+year_data$pred_sep <- predict(lmod, newdata=year_data)
+
+print(year_data)
+ggplot(data = year_data %>% select(Year,jul, sep, pred_sep) %>% 
+         gather(key = pred, value = num_bikes, -c(Year, jul))) +
+  geom_point(aes(x=jul, y=num_bikes, color = pred)) +
+  theme_bw() +
+  ylab("Minimum number of bikes in September") +
+  xlab("Post-information minimum number of bikes in July") +
+  theme(axis.title=element_text(size=10), axis.text=element_text(size=10),
+        legend.title=element_text(size=10),
+        legend.text=element_text(size=12)) +
+  xlim(0,700) +
+  ylim(0,700)
+```
+
+
+
+# Creating synthetic dataset for showcase of predictions
+
+```{r}
+orig_pred = read_csv("df_prediction_original.csv") %>% arrange(weekday, hour.of.day, start.area, end.area)
+df_test1 = read_csv("sep19_filter_agg_scen1.csv") %>% filter(Day == 6)
+sum(df_test1$dep_flow)
+
+orig_pred_06 = read_csv("df_prediction_original.csv") %>% filter(hour.of.day < 6)
+orig_pred_612 = read_csv("df_prediction_original.csv") %>% filter(hour.of.day >= 6 & hour.of.day < 12)
+orig_pred_1218 = read_csv("df_prediction_original.csv") %>% filter(hour.of.day >= 12 & hour.of.day < 18)
+orig_pred_1824 = read_csv("df_prediction_original.csv") %>% filter(hour.of.day >= 18)
+
+synth_scen <- function(weekday1, q.temp, q.hmd, q.drct, q.wind, q.pcpt, q.press, q.vis, q.gust){
+  synth_pred = data.frame(matrix(ncol = 16, nrow = 0))
+  colnames(synth_pred) = colnames(orig_pred)
+  
+  synth_pred_06 <- synth_pred %>% complete(start.area = 1:50, end.area = 1:50, hour.of.day = 0:5) %>%
+    mutate(weekday = weekday1,
+           avg.temp = quantile(orig_pred_06$avg.temp, q.temp),
+           avg.hmd = quantile(orig_pred_06$avg.hmd, q.hmd),
+           avg.drct = quantile(orig_pred_06$avg.drct, q.drct),
+           avg.wind = quantile(orig_pred_06$avg.wind, q.wind),
+           sum.pcpt = quantile(orig_pred_06$sum.pcpt, q.pcpt),
+           avg.press = quantile(orig_pred_06$avg.press, q.press),
+           avg.vis = quantile(orig_pred_06$avg.vis, q.vis),
+           max.gust = quantile(orig_pred_06$max.gust, q.gust)
+           )
+  
+  synth_pred_612 <- synth_pred %>% complete(start.area = 1:50, end.area = 1:50, hour.of.day = 6:11) %>%
+    mutate(weekday = weekday1,
+           avg.temp = quantile(orig_pred_612$avg.temp, q.temp),
+           avg.hmd = quantile(orig_pred_612$avg.hmd, q.hmd),
+           avg.drct = quantile(orig_pred_612$avg.drct, q.drct),
+           avg.wind = quantile(orig_pred_612$avg.wind, q.wind),
+           sum.pcpt = quantile(orig_pred_612$sum.pcpt, q.pcpt),
+           avg.press = quantile(orig_pred_612$avg.press, q.press),
+           avg.vis = quantile(orig_pred_612$avg.vis, q.vis),
+           max.gust = quantile(orig_pred_612$max.gust, q.gust)
+           )
+  
+  synth_pred_1218 <- synth_pred %>% complete(start.area = 1:50, end.area = 1:50, hour.of.day = 12:17) %>%
+    mutate(weekday = weekday1,
+           avg.temp = quantile(orig_pred_1218$avg.temp, q.temp),
+           avg.hmd = quantile(orig_pred_1218$avg.hmd, q.hmd),
+           avg.drct = quantile(orig_pred_1218$avg.drct, q.drct),
+           avg.wind = quantile(orig_pred_1218$avg.wind, q.wind),
+           sum.pcpt = quantile(orig_pred_1218$sum.pcpt, q.pcpt),
+           avg.press = quantile(orig_pred_1218$avg.press, q.press),
+           avg.vis = quantile(orig_pred_1218$avg.vis, q.vis),
+           max.gust = quantile(orig_pred_1218$max.gust, q.gust)
+           )
+  
+  synth_pred_1824 <- synth_pred %>% complete(start.area = 1:50, end.area = 1:50, hour.of.day = 18:23) %>%
+    mutate(weekday = weekday1,
+           avg.temp = quantile(orig_pred_1824$avg.temp, q.temp),
+           avg.hmd = quantile(orig_pred_1824$avg.hmd, q.hmd),
+           avg.drct = quantile(orig_pred_1824$avg.drct, q.drct),
+           avg.wind = quantile(orig_pred_1824$avg.wind, q.wind),
+           sum.pcpt = quantile(orig_pred_1824$sum.pcpt, q.pcpt),
+           avg.press = quantile(orig_pred_1824$avg.press, q.press),
+           avg.vis = quantile(orig_pred_1824$avg.vis, q.vis),
+           max.gust = quantile(orig_pred_1824$max.gust, q.gust)
+           )
+  
+  synth_pred = rbind(synth_pred_06,synth_pred_612, synth_pred_1218, synth_pred_1824)
+  
+  synth_pred
+}
+
+synth_pred1 <- synth_scen(weekday = 0, q.temp = 0.9, 
+                          q.hmd = 0.1, q.drct = 0.5 , q.wind = 0.1, q.pcpt = 0.1, 
+                          q.press = 0.9, q.vis = 0.9, q.gust = 0.1)
+
+synth_pred2 <- synth_scen(weekday = 0, q.temp = 0.1, 
+                          q.hmd = 0.9, q.drct = 0.1 , q.wind = 0.9, q.pcpt = 0.9, 
+                          q.press = 0.1, q.vis = 0.2, q.gust = 0.8)
+
+synth_pred3 <- synth_scen(weekday = 5, q.temp = 0.9, 
+                          q.hmd = 0.1, q.drct = 0.5 , q.wind = 0.1, q.pcpt = 0.1, 
+                          q.press = 0.9, q.vis = 0.9, q.gust = 0.1)
+
+synth_pred4 <- synth_scen(weekday = 5, q.temp = 0.1,
+                          q.hmd = 0.9, q.drct = 0.1 , q.wind = 0.9, q.pcpt = 0.9, 
+                          q.press = 0.1, q.vis = 0.2, q.gust = 0.8)
+
+write.csv(synth_pred1,'synth_pred1.csv')
+write.csv(synth_pred2,'synth_pred2.csv')
+write.csv(synth_pred3,'synth_pred3.csv')
+write.csv(synth_pred4,'synth_pred4.csv')
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Sample code
+```{r}
+synth_pred = data.frame(matrix(ncol = 16, nrow = 0))
+colnames(synth_pred) = colnames(orig_pred)
+
+# Fake day 1: Monday, sunny, low wind
+
+synth_pred1_06 <- synth_pred %>% complete(start.area = 1:50, end.area = 1:50, hour.of.day = 0:5) %>%
+  mutate(weekday = 0,
+         avg.temp = quantile(orig_pred_06$avg.temp, 0.9),
+         avg.hmd = quantile(orig_pred_06$avg.hmd, 0.1),
+         avg.drct = quantile(orig_pred_06$avg.drct, 0.5),
+         avg.wind = quantile(orig_pred_06$avg.wind, 0.1),
+         sum.pcpt = quantile(orig_pred_06$sum.pcpt, 0.01),
+         avg.press = quantile(orig_pred_06$avg.press, 0.9),
+         avg.vis = quantile(orig_pred_06$avg.vis, 0.9),
+         max.gust = quantile(orig_pred_06$max.gust, 0.1)
+         )
+
+synth_pred1_612 <- synth_pred %>% complete(start.area = 1:50, end.area = 1:50, hour.of.day = 6:11) %>%
+  mutate(weekday = 0,
+         avg.temp = quantile(orig_pred_612$avg.temp, 0.9),
+         avg.hmd = quantile(orig_pred_612$avg.hmd, 0.1),
+         avg.drct = quantile(orig_pred_612$avg.drct, 0.5),
+         avg.wind = quantile(orig_pred_612$avg.wind, 0.1),
+         sum.pcpt = quantile(orig_pred_612$sum.pcpt, 0.01),
+         avg.press = quantile(orig_pred_612$avg.press, 0.9),
+         avg.vis = quantile(orig_pred_612$avg.vis, 0.9),
+         max.gust = quantile(orig_pred_612$max.gust, 0.1)
+         )
+
+synth_pred1_1218 <- synth_pred %>% complete(start.area = 1:50, end.area = 1:50, hour.of.day = 12:17) %>%
+  mutate(weekday = 0,
+         avg.temp = quantile(orig_pred_1218$avg.temp, 0.9),
+         avg.hmd = quantile(orig_pred_1218$avg.hmd, 0.1),
+         avg.drct = quantile(orig_pred_1218$avg.drct, 0.5),
+         avg.wind = quantile(orig_pred_1218$avg.wind, 0.1),
+         sum.pcpt = quantile(orig_pred_1218$sum.pcpt, 0.01),
+         avg.press = quantile(orig_pred_1218$avg.press, 0.9),
+         avg.vis = quantile(orig_pred_1218$avg.vis, 0.9),
+         max.gust = quantile(orig_pred_1218$max.gust, 0.1)
+         )
+
+synth_pred1_1824 <- synth_pred %>% complete(start.area = 1:50, end.area = 1:50, hour.of.day = 18:23) %>%
+  mutate(weekday = 0,
+         avg.temp = quantile(orig_pred_1824$avg.temp, 0.9),
+         avg.hmd = quantile(orig_pred_1824$avg.hmd, 0.1),
+         avg.drct = quantile(orig_pred_1824$avg.drct, 0.5),
+         avg.wind = quantile(orig_pred_1824$avg.wind, 0.1),
+         sum.pcpt = quantile(orig_pred_1824$sum.pcpt, 0.01),
+         avg.press = quantile(orig_pred_1824$avg.press, 0.9),
+         avg.vis = quantile(orig_pred_1824$avg.vis, 0.9),
+         max.gust = quantile(orig_pred_1824$max.gust, 0.1)
+         )
+
+synth_pred1 = rbind(synth_pred1_06,synth_pred1_612, synth_pred1_1218, synth_pred1_1824)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Old Stuff
+
+## Releasability and dockability
+
+```{r}
+df = read.csv("Rideability.csv")
+
+# Appropriate names
+for (i in 3:ncol(df)){
+  names(df)[i] <- paste(names(df)[i], sub("Unweighted ", "", df[1,i]), sep = ".")
+  }
+df = df[2:nrow(df),2:ncol(df)]
+
+# Change data type
+percent_to_num <- function(x) as.numeric(sub("%", "", x))
+df <- df %>% mutate(
+  time.interval = as.POSIXct(Name), 
+  .keep = "unused", 
+  .before = "Beacon.St.at.Massachusetts.Ave.Dockability"
+  ) %>%
+  mutate_if(is.character, percent_to_num) %>%
+  mutate(year = as.integer(format(time.interval, "%Y")),
+         month = as.integer(format(time.interval, "%m")),
+         day.of.month = as.integer(format(time.interval, "%d")),
+         day.of.week = as.integer(format(time.interval, "%w")),
+         hour = as.integer(format(time.interval, "%H")),
+         min = as.integer(format(time.interval, "%M")),
+         time.of.day = hour + (min/60),
+         .before = "Beacon.St.at.Massachusetts.Ave.Dockability")
+
+train <- df %>% filter(month == 6, year == 2019)
+
+summary(train)
+```
+
+```{r}
+# Scatter plot by day of week
+ggplot(data=train ,aes(x=time.of.day)) +
+  geom_point(aes(y=Beacon.St.at.Massachusetts.Ave.Dockability,color=factor(day.of.week)),size=.5) +
+  theme_bw() +
+  xlab('Time of day') +
+  ylab("Dockability at Beacon.St.at.Massachusetts.Ave") +
+  theme(axis.title=element_text(size=10), axis.text=element_text(size=10), legend.title=element_text(size=10), legend.text=element_text(size=12)) + 
+  scale_color_brewer(name='Weekday',labels=c('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'), palette="Set1")
+```
+
+```{r}
+# Scatter plot by day of week
+ggplot(data=train %>% filter(day.of.week == 5),aes(x=time.of.day)) +
+  geom_point(aes(y=MIT.at.Mass.Ave...Amherst.St.1.Releasability,color=factor(day.of.week)),size=.5) +
+  theme_bw() +
+  xlab('Time of day') +
+  ylab("Releasability at Mass.Ave...Amherst.St.1.") +
+  theme(axis.title=element_text(size=10), axis.text=element_text(size=10), legend.title=element_text(size=10), legend.text=element_text(size=12)) + 
+  scale_color_brewer(name='Weekday',labels=c('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'), palette="Set1")
+```
+
+
+
+```{r}
+# This next cell is old stuff
+
+# See what bikes coming in and out a station look like
+# hv.station.start <- df %>% filter(start.station.id == 149) %>%
+#   mutate(ind = 1) %>%
+#   arrange(starttime) %>%
+#   group_by(start.day.of.month) %>%
+#   mutate(cum.arrivals = cumsum(ind))
+# 
+# hv.station.end <- df %>% filter(end.station.id == 149) %>%
+#   mutate(ind = 1) %>%
+#   arrange(starttime) %>%
+#   group_by(start.day.of.month) %>%
+#   mutate(cum.departures = cumsum(ind))
+# 
+# hv.station <- df %>% filter(start.station.id == 149) %>%
+#   mutate(start.ind = 1) %>%
+#   merge(df %>% filter(end.station.id == 149) %>%
+#           mutate(end.ind = 1),
+#         all.x = TRUE, all.y = TRUE) %>%
+#   group_by(start.day.of.month) %>%
+#   arrange(starttime) %>%
+#   mutate(cum.departure = cumsum(replace_na(start.ind, 0)),
+#          cum.arrival = cumsum(replace_na(end.ind,0))) %>%
+#   mutate(net.cum.arrivals = cum.arrival - cum.departure)
+```
